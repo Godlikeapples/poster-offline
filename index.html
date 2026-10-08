@@ -402,7 +402,6 @@
 </div>
 
 <!-- Libraries -->
-<script src="vendor/mediapipe/face_detection/face_detection.js"></script>
 <script src="jsQR.js"></script>
 <script src="qrcode-generator.min.js"></script>
 
@@ -558,10 +557,12 @@ function loadTemplate() {
   });
 }
 
-// ==================== AI: Face Detection (MediaPipe v0.4) ====================
-let faceDetector = null;
+// ==================== AI: Face Detection (MediaPipe Worker) ====================
+let faceWorker = null;
 let faceDetectorReady = false;
 let faceDetectorInitPromise = null;
+let faceRequestId = 0;
+const faceRequests = new Map();
 const FACE_DETECT_MAX_DIM = 1600;
 const FACE_DETECT_TIMEOUT_MS = 6000;
 const FACE_INIT_TIMEOUT_MS = 10000;
@@ -570,31 +571,66 @@ async function initFaceDetector() {
   if (faceDetectorInitPromise) return faceDetectorInitPromise;
 
   faceDetectorInitPromise = (async () => {
-    if (typeof FaceDetection === 'undefined') {
-      console.warn('MediaPipe Face Detection library not loaded');
+    if (typeof Worker === 'undefined'
+      || typeof OffscreenCanvas === 'undefined'
+      || typeof createImageBitmap !== 'function') {
+      console.warn('Face detection Worker is not supported by this browser');
       return false;
     }
+
     try {
-      faceDetector = new FaceDetection({
-        locateFile: (file) =>
-          `vendor/mediapipe/face_detection/${file}`
+      faceWorker = new Worker('face-detector-worker.js');
+      faceWorker.onmessage = (event) => {
+        const message = event.data || {};
+        if (message.type === 'ready') {
+          faceDetectorReady = true;
+          console.log('MediaPipe Face Detector Worker ready');
+          return;
+        }
+        if (message.type === 'result' || message.type === 'error') {
+          const request = faceRequests.get(message.id);
+          if (!request) return;
+          faceRequests.delete(message.id);
+          clearTimeout(request.timer);
+          request.resolve(message.type === 'result' ? message.face : null);
+        }
+      };
+      faceWorker.onerror = (event) => {
+        console.warn('Face detection Worker error:', event.message || event);
+        faceDetectorReady = false;
+        for (const request of faceRequests.values()) {
+          clearTimeout(request.timer);
+          request.resolve(null);
+        }
+        faceRequests.clear();
+      };
+
+      const readyPromise = new Promise((resolve) => {
+        const onReady = (event) => {
+          if (event.data?.type !== 'ready' && event.data?.type !== 'init-error') return;
+          faceWorker.removeEventListener('message', onReady);
+          resolve(event.data.type === 'ready');
+        };
+        faceWorker.addEventListener('message', onReady);
       });
-      faceDetector.setOptions({
-        model: 'short',
-        minDetectionConfidence: 0.5,
+      faceWorker.postMessage({
+        type: 'init',
+        maxDimension: FACE_DETECT_MAX_DIM,
       });
-      await Promise.race([
-        faceDetector.initialize(),
-        new Promise((_, reject) => setTimeout(
-          () => reject(new Error('MediaPipe initialization timed out')),
-          FACE_INIT_TIMEOUT_MS
-        )),
+      const ready = await Promise.race([
+        readyPromise,
+        new Promise(resolve => setTimeout(() => resolve(false), FACE_INIT_TIMEOUT_MS)),
       ]);
-      faceDetectorReady = true;
-      console.log('MediaPipe Face Detector ready');
-      return true;
+      if (!ready) {
+        faceWorker.terminate();
+        faceWorker = null;
+        return false;
+      }
+      return faceDetectorReady;
     } catch (e) {
       console.warn('MediaPipe init failed:', e);
+      faceWorker?.terminate();
+      faceWorker = null;
       return false;
     }
   })();
@@ -602,68 +638,39 @@ async function initFaceDetector() {
   return faceDetectorInitPromise;
 }
 
-function detectFaceWithMediaPipe(img) {
+function detectFaceWithWorker(img) {
   return new Promise((resolve) => {
-    let resolved = false;
+    if (!faceWorker || !faceDetectorReady) {
+      resolve(null);
+      return;
+    }
+
     const sourceW = img.naturalWidth || img.width;
     const sourceH = img.naturalHeight || img.height;
-    const scale = Math.min(1, FACE_DETECT_MAX_DIM / Math.max(sourceW, sourceH));
-    const detectW = Math.max(1, Math.round(sourceW * scale));
-    const detectH = Math.max(1, Math.round(sourceH * scale));
-    let timer;
+    if (!sourceW || !sourceH) {
+      resolve(null);
+      return;
+    }
 
-    const finish = (result) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
-
-    timer = setTimeout(() => {
-      finish(null);
+    const id = ++faceRequestId;
+    const timer = setTimeout(() => {
+      faceRequests.delete(id);
+      resolve(null);
     }, FACE_DETECT_TIMEOUT_MS);
 
-    faceDetector.onResults((results) => {
-      if (!results.detections || results.detections.length === 0) {
-        finish(null);
-        return;
+    faceRequests.set(id, { resolve, timer });
+    const send = async () => {
+      try {
+        const bitmap = await createImageBitmap(img);
+        faceWorker.postMessage({ type: 'detect', id, bitmap }, [bitmap]);
+      } catch (error) {
+        clearTimeout(timer);
+        faceRequests.delete(id);
+        console.warn('Could not create ImageBitmap for face Worker:', error);
+        resolve(null);
       }
-
-      const d = results.detections[0];
-      const W = sourceW;
-      const H = sourceH;
-
-      const lm = d.landmarks.map(p => ({ x: p.x * W, y: p.y * H }));
-      // landmarks: 0=leftEye, 1=rightEye, 2=noseTip, 3=mouth, 4=leftEar, 5=rightEar
-      const leftEye = lm[0], rightEye = lm[1];
-      const mouth = lm[3], leftEar = lm[4], rightEar = lm[5];
-
-      const eyeCenterX = (leftEye.x + rightEye.x) / 2;
-      const boxCenterX = d.boundingBox && Number.isFinite(d.boundingBox.xCenter)
-        ? d.boundingBox.xCenter * W
-        : eyeCenterX;
-      // The face box is more stable horizontally than the eye midpoint for turned heads.
-      const cx = boxCenterX;
-      const eyesMidY = (leftEye.y + rightEye.y) / 2;
-      const cy = eyesMidY + (mouth.y - eyesMidY) * 0.45;
-
-      const earDist = Math.abs(rightEar.x - leftEar.x);
-      const eyeDist = Math.abs(rightEye.x - leftEye.x);
-      const faceW = earDist > eyeDist * 0.6 ? earDist * 1.1 : eyeDist * 2.8;
-
-      finish({ cx, cy, faceW, W, H });
-    });
-
-    const c = document.createElement('canvas');
-    c.width = detectW;
-    c.height = detectH;
-    c.getContext('2d').drawImage(img, 0, 0, detectW, detectH);
-    try {
-      const sendResult = faceDetector.send({ image: c });
-      if (sendResult?.catch) sendResult.catch(() => finish(null));
-    } catch (_) {
-      finish(null);
-    }
+    };
+    send();
   });
 }
 
@@ -671,10 +678,10 @@ async function detectAndCropPortrait(img) {
   const W = img.naturalWidth || img.width;
   const H = img.naturalHeight || img.height;
 
-  // Try MediaPipe face detection
-  if (!faceDetectorReady && faceDetectorInitPromise) {
+  // Wait for the background Worker when an upload happens during startup.
+  if (!faceDetectorReady) {
     try {
-      await faceDetectorInitPromise;
+      await initFaceDetector();
     } catch (e) {
       console.warn('Face detector unavailable, using center crop:', e);
     }
@@ -682,7 +689,7 @@ async function detectAndCropPortrait(img) {
 
   if (faceDetectorReady) {
     try {
-      const face = await detectFaceWithMediaPipe(img);
+      const face = await detectFaceWithWorker(img);
       if (face) {
         const { cx, cy, faceW } = face;
         let size = Math.round(Math.min(faceW * 3.7, Math.min(W, H)));
@@ -1233,6 +1240,11 @@ async function init() {
     // Paint the template before starting the heavier face detector download.
     render();
     const startFaceDetector = () => {
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('sw.js').catch((error) => {
+          console.warn('Service Worker registration failed:', error);
+        });
+      }
       initFaceDetector().then(ok => {
         if (ok) console.log('MediaPipe ready');
       });
