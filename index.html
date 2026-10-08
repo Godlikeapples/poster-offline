@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>海报-离线</title>
 <link rel="stylesheet" href="fonts/noto-sans-sc.css">
+<link rel="preload" href="poster-template.webp" as="image" type="image/webp">
 <style>
   :root {
     --bg: #f0f2f5;
@@ -1229,12 +1230,19 @@ async function init() {
       }).catch(() => {});
     }
 
-    // Always render on load — show the blank template immediately
+    // Paint the template before starting the heavier face detector download.
     render();
-    // Preload face detector in background
-    initFaceDetector().then(ok => {
-      if (ok) console.log('MediaPipe ready');
-    });
+    const startFaceDetector = () => {
+      initFaceDetector().then(ok => {
+        if (ok) console.log('MediaPipe ready');
+      });
+    };
+    // A timer after the first animation frame gives the browser a real paint opportunity.
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => setTimeout(startFaceDetector, 0));
+    } else {
+      setTimeout(startFaceDetector, 0);
+    }
   } catch (err) {
     console.error('Init failed:', err);
     toast('模板加载失败，请刷新页面重试');
