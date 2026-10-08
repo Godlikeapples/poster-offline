@@ -637,7 +637,12 @@ function detectFaceWithMediaPipe(img) {
       const leftEye = lm[0], rightEye = lm[1];
       const mouth = lm[3], leftEar = lm[4], rightEar = lm[5];
 
-      const cx = (leftEye.x + rightEye.x) / 2;
+      const eyeCenterX = (leftEye.x + rightEye.x) / 2;
+      const boxCenterX = d.boundingBox && Number.isFinite(d.boundingBox.xCenter)
+        ? d.boundingBox.xCenter * W
+        : eyeCenterX;
+      // The face box is more stable horizontally than the eye midpoint for turned heads.
+      const cx = boxCenterX;
       const eyesMidY = (leftEye.y + rightEye.y) / 2;
       const cy = eyesMidY + (mouth.y - eyesMidY) * 0.45;
 
