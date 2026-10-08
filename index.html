@@ -928,6 +928,11 @@ function render() {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
 
+    // 防粗描边在汉字锐角处产生黑色尖刺（miter→round）
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.miterLimit = 2;
+
     // 3D extrusion layers — draw dark strokes offset progressively
     const layers = [
       { x: 8, y: 8, w: 4, c: '#1a1a1a' },
