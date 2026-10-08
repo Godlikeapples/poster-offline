@@ -3,10 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<title>海报生成器</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@700&display=swap" rel="stylesheet">
+<title>海报-离线</title>
+<link rel="stylesheet" href="fonts/noto-sans-sc.css">
 <style>
   :root {
     --bg: #f0f2f5;
@@ -403,7 +401,7 @@
 </div>
 
 <!-- Libraries -->
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_detection@0.4.1646425229/face_detection.js" crossorigin="anonymous"></script>
+<script src="vendor/mediapipe/face_detection/face_detection.js"></script>
 <script src="jsQR.js"></script>
 <script src="qrcode-generator.min.js"></script>
 
@@ -445,7 +443,7 @@ const QR_SIDE = 730;
 const NAME_CX = 1545;
 const NAME_CY = 2100;
 const NAME_MAX_W = 1200;
-const NAME_FS_MIN = 170;
+const NAME_FS_MIN = 90;
 const NAME_FS_MAX = 170;
 
 const DEPT_CX = 1545;
@@ -460,6 +458,7 @@ const BIO_MAX_W = 2300;
 const BIO_FS_MIN = 90;
 const BIO_FS_MAX = 90;
 const BIO_LINE_H = 1.4;
+const MAX_IMAGE_PIXELS = 40_000_000;
 
 // ==================== State ====================
 const state = {
@@ -535,6 +534,14 @@ async function loadImageFromFile(file) {
   });
 }
 
+function validateImageSize(img, label) {
+  const width = img.naturalWidth || img.width;
+  const height = img.naturalHeight || img.height;
+  if (!width || !height || width * height > MAX_IMAGE_PIXELS) {
+    throw new Error(`${label}分辨率过大，请使用 4000 万像素以内的图片`);
+  }
+}
+
 function loadTemplate() {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -565,7 +572,7 @@ async function initFaceDetector() {
     try {
       faceDetector = new FaceDetection({
         locateFile: (file) =>
-          `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection@0.4.1646425229/${file}`
+          `vendor/mediapipe/face_detection/${file}`
       });
       faceDetector.setOptions({
         model: 'short',
@@ -1042,10 +1049,11 @@ async function handlePortraitFile(file) {
   showSpinner();
   portraitHint.textContent = '正在 AI 识别人脸…';
   portraitHint.className = 'hint-text';
+  let img = null;
   try {
-    const img = await loadImageFromFile(file);
+    img = await loadImageFromFile(file);
+    validateImageSize(img, '人像图片');
     const result = await detectAndCropPortrait(img);
-    img.close();
     state.portraitCrop = result.canvas;
     portraitLabel.textContent = file.name.length > 10
       ? file.name.slice(0, 8) + '…' : file.name;
@@ -1061,6 +1069,7 @@ async function handlePortraitFile(file) {
     portraitHint.className = 'hint-text err';
     toast('人像处理失败，请重试');
   } finally {
+    img?.close();
     hideSpinner();
   }
 }
@@ -1074,10 +1083,11 @@ async function handleQRFile(file) {
   showSpinner();
   qrHint.textContent = '正在识别二维码…';
   qrHint.className = 'hint-text';
+  let img = null;
   try {
-    const img = await loadImageFromFile(file);
+    img = await loadImageFromFile(file);
+    validateImageSize(img, '二维码图片');
     const result = await detectAndCropQR(img, file);
-    img.close();
     state.qrCrop = result.canvas;
     qrLabel.textContent = file.name.length > 10
       ? file.name.slice(0, 8) + '…' : file.name;
@@ -1096,6 +1106,7 @@ async function handleQRFile(file) {
     qrHint.className = 'hint-text err';
     toast('二维码处理失败，请重试');
   } finally {
+    img?.close();
     hideSpinner();
   }
 }
@@ -1172,6 +1183,12 @@ async function init() {
         `Template dimensions mismatch: expected ${TPL_W}x${TPL_H}, got ${state.template.naturalWidth}x${state.template.naturalHeight}`
       );
     }
+    // Wait for the bundled font before the first canvas render so output is deterministic.
+    if (document.fonts) {
+      await document.fonts.load('700 170px "Noto Sans SC"', '张三姓名');
+      await document.fonts.ready;
+    }
+
     // Always render on load — show the blank template immediately
     render();
     // Preload face detector in background
