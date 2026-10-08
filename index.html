@@ -466,6 +466,7 @@ const state = {
   portraitCrop: null,
   qrCrop: null,
 };
+let fontReadyPromise = Promise.resolve();
 
 // Output canvas (full resolution)
 const outCanvas = document.createElement('canvas');
@@ -560,13 +561,16 @@ function loadTemplate() {
 let faceDetector = null;
 let faceDetectorReady = false;
 let faceDetectorInitPromise = null;
+const FACE_DETECT_MAX_DIM = 1600;
+const FACE_DETECT_TIMEOUT_MS = 6000;
+const FACE_INIT_TIMEOUT_MS = 10000;
 
 async function initFaceDetector() {
   if (faceDetectorInitPromise) return faceDetectorInitPromise;
 
   faceDetectorInitPromise = (async () => {
     if (typeof FaceDetection === 'undefined') {
-      console.warn('MediaPipe Face Detection CDN not loaded');
+      console.warn('MediaPipe Face Detection library not loaded');
       return false;
     }
     try {
@@ -578,7 +582,13 @@ async function initFaceDetector() {
         model: 'short',
         minDetectionConfidence: 0.5,
       });
-      await faceDetector.initialize();
+      await Promise.race([
+        faceDetector.initialize(),
+        new Promise((_, reject) => setTimeout(
+          () => reject(new Error('MediaPipe initialization timed out')),
+          FACE_INIT_TIMEOUT_MS
+        )),
+      ]);
       faceDetectorReady = true;
       console.log('MediaPipe Face Detector ready');
       return true;
@@ -594,24 +604,33 @@ async function initFaceDetector() {
 function detectFaceWithMediaPipe(img) {
   return new Promise((resolve) => {
     let resolved = false;
+    const sourceW = img.naturalWidth || img.width;
+    const sourceH = img.naturalHeight || img.height;
+    const scale = Math.min(1, FACE_DETECT_MAX_DIM / Math.max(sourceW, sourceH));
+    const detectW = Math.max(1, Math.round(sourceW * scale));
+    const detectH = Math.max(1, Math.round(sourceH * scale));
+    let timer;
 
-    const timer = setTimeout(() => {
-      if (!resolved) { resolved = true; resolve(null); }
-    }, 8000);
-
-    faceDetector.onResults((results) => {
+    const finish = (result) => {
       if (resolved) return;
       resolved = true;
       clearTimeout(timer);
+      resolve(result);
+    };
 
+    timer = setTimeout(() => {
+      finish(null);
+    }, FACE_DETECT_TIMEOUT_MS);
+
+    faceDetector.onResults((results) => {
       if (!results.detections || results.detections.length === 0) {
-        resolve(null);
+        finish(null);
         return;
       }
 
       const d = results.detections[0];
-      const W = img.naturalWidth || img.width;
-      const H = img.naturalHeight || img.height;
+      const W = sourceW;
+      const H = sourceH;
 
       const lm = d.landmarks.map(p => ({ x: p.x * W, y: p.y * H }));
       // landmarks: 0=leftEye, 1=rightEye, 2=noseTip, 3=mouth, 4=leftEar, 5=rightEar
@@ -626,14 +645,19 @@ function detectFaceWithMediaPipe(img) {
       const eyeDist = Math.abs(rightEye.x - leftEye.x);
       const faceW = earDist > eyeDist * 0.6 ? earDist * 1.1 : eyeDist * 2.8;
 
-      resolve({ cx, cy, faceW, W, H });
+      finish({ cx, cy, faceW, W, H });
     });
 
     const c = document.createElement('canvas');
-    c.width = img.naturalWidth || img.width;
-    c.height = img.naturalHeight || img.height;
-    c.getContext('2d').drawImage(img, 0, 0);
-    faceDetector.send({ image: c });
+    c.width = detectW;
+    c.height = detectH;
+    c.getContext('2d').drawImage(img, 0, 0, detectW, detectH);
+    try {
+      const sendResult = faceDetector.send({ image: c });
+      if (sendResult?.catch) sendResult.catch(() => finish(null));
+    } catch (_) {
+      finish(null);
+    }
   });
 }
 
@@ -643,7 +667,11 @@ async function detectAndCropPortrait(img) {
 
   // Try MediaPipe face detection
   if (!faceDetectorReady && faceDetectorInitPromise) {
-    await faceDetectorInitPromise;
+    try {
+      await faceDetectorInitPromise;
+    } catch (e) {
+      console.warn('Face detector unavailable, using center crop:', e);
+    }
   }
 
   if (faceDetectorReady) {
@@ -1159,7 +1187,8 @@ bioInput.addEventListener('input', () => {
 });
 
 // ==================== Download ====================
-downloadBtn.addEventListener('click', () => {
+downloadBtn.addEventListener('click', async () => {
+  await fontReadyPromise;
   const name = nameInput.value.trim() || '未命名';
   const ds = new Date().toISOString().slice(0, 10).replace(/-/g, '');
   outCanvas.toBlob((blob) => {
@@ -1183,10 +1212,16 @@ async function init() {
         `Template dimensions mismatch: expected ${TPL_W}x${TPL_H}, got ${state.template.naturalWidth}x${state.template.naturalHeight}`
       );
     }
-    // Wait for the bundled font before the first canvas render so output is deterministic.
+    // Show the template immediately; load the bundled font in the background.
     if (document.fonts) {
-      await document.fonts.load('700 170px "Noto Sans SC"', '张三姓名');
-      await document.fonts.ready;
+      const loadPromise = document.fonts.load('700 170px "Noto Sans SC"', '张三姓名');
+      fontReadyPromise = Promise.race([
+        loadPromise,
+        new Promise(resolve => setTimeout(resolve, 5000)),
+      ]).catch(() => {});
+      loadPromise.then(() => {
+        if (state.template) render();
+      }).catch(() => {});
     }
 
     // Always render on load — show the blank template immediately
